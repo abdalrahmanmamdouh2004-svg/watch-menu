@@ -1,0 +1,421 @@
+package com.example
+
+import android.app.Notification
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.service.notification.StatusBarNotification
+import android.app.RemoteInput
+import java.util.Calendar
+import java.util.Locale
+
+/**
+ * Serves the separate watch app "Watch Replies": the chats of WhatsApp, Messenger and Telegram that can be answered
+ * from their notification, shown on the watch and answered with the watch's keyboard.
+ *
+ * Messages all start with "r1" (see the watch app's proto.rs), so they never mix with Watch Music's messages. Nothing
+ * here does anything until the Replies app says hello, so the phone works the same with only one of the two watch apps
+ * installed, or both (only one runs on the watch at a time).
+ */
+object Replies {
+    private const val MSG = 0x90A5
+    private const val MAX_CHATS = 8
+    private const val NAME_MAX = 24
+    private const val TEXT_MAX = 96
+    private val QUICK = listOf("Ok", "On my way", "Thanks!")
+
+    private class Chat(
+        val id: Int, val key: String, val app: Int, val packageName: String, var name: String, var text: String, var at: Long, // WATCHMENU_REPLIES_CHAT_PACKAGE_V1
+        var intent: PendingIntent, var inputs: Array<RemoteInput>,
+        var msgs: List<Pair<String, Long>> = emptyList(), var fresh: List<Pair<String, Long>> = emptyList(),
+        var preserveUntil: Long = 0L,
+    )
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val chats = LinkedHashMap<String, Chat>() // oldest first
+    private var open = false
+    private var slot = -1
+    private var app: Context? = null
+
+    // ---- notifications (called from MediaListenerService) ----
+
+    /** A stable key for one DM or one group, shared across all three supported chat apps. */
+    internal fun conversationKey(
+        packageName: String,
+        shortcutId: String?,
+        notificationKey: String,
+        conversationTitle: String? = null,
+        notificationTitle: String? = null,
+        senderIdentity: String? = null
+    ): String {
+        val shortcut = shortcutId?.trim()?.takeIf { it.isNotEmpty() }
+        val group = conversationTitle?.trim()?.takeIf { it.isNotEmpty() }
+        val title = notificationTitle?.trim()?.takeIf { it.isNotEmpty() }
+        val sender = senderIdentity?.trim()?.takeIf { it.isNotEmpty() }
+        val appLabel = when (packageName) {
+            "com.whatsapp", "com.whatsapp.w4b" -> "WhatsApp"
+            "com.facebook.orca", "com.facebook.mlite" -> "Messenger"
+            "org.telegram.messenger", "org.telegram.messenger.web", "org.telegram.plus" -> "Telegram"
+            else -> ""
+        }
+        val usefulTitle = title?.takeUnless { appLabel.isNotEmpty() && it.equals(appLabel, ignoreCase = true) }
+        val identity = shortcut?.let { "shortcut:$it" } ?: when {
+            group != null -> "group:${group.lowercase(Locale.ROOT)}"
+            usefulTitle != null -> "person:${usefulTitle.lowercase(Locale.ROOT)}"
+            sender != null -> "sender:${sender.lowercase(Locale.ROOT)}"
+            title != null -> "title:${title.lowercase(Locale.ROOT)}"
+            else -> "notification:$notificationKey"
+        }
+        return "$packageName:$identity"
+    }
+
+    private fun conversationKey(sbn: StatusBarNotification, n: Notification): String {
+        val extras = n.extras
+        val isGroup = extras?.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false) == true
+        val explicitConversation = extras?.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()
+        val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+        val groupTitle = explicitConversation ?: if (isGroup) title else null
+        val messages = extras?.getParcelableArray(Notification.EXTRA_MESSAGES)
+        val last = messages?.lastOrNull() as? Bundle
+        val sender = last?.let { senderIdentity(it) }
+        val shortcut = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) n.shortcutId else null
+        return conversationKey(sbn.packageName, shortcut, sbn.key, groupTitle, title, sender)
+    }
+
+    private fun appOf(pkg: String) = when (pkg) {
+        "com.whatsapp", "com.whatsapp.w4b" -> 1
+        "com.facebook.orca", "com.facebook.mlite" -> 2
+        "org.telegram.messenger", "org.telegram.messenger.web", "org.telegram.plus" -> 3
+        else -> 0
+    }
+
+    fun onPosted(c: Context, sbn: StatusBarNotification) {
+        handler.post { loadOne(c, sbn)?.let { ch -> if (open) ch.fresh.forEach { enqueue(listMessage(ch, it.first, it.second)) } } }
+    }
+
+
+    /** Rebuilds the open Replies inbox after its independent ignore list changes. */
+    fun refreshIgnored(context: Context) {
+        handler.post {
+            app = context.applicationContext
+            val removed = chats.values.filter { RepliesIgnoreConfig.isIgnored(context, it.packageName) }
+            removed.forEach { chats.remove(it.key) }
+            // Re-read active notifications so unignoring an app restores its current conversations
+            // immediately, without waiting for that app to post a new notification.
+            try {
+                MediaListenerService.instance?.activeNotifications?.sortedBy { it.postTime }?.forEach { active ->
+                    loadOne(context, active)
+                }
+            } catch (e: Exception) { AppLogger.logError("Replies", "refresh ignore list", e) }
+            if (open) {
+                clearQueue()
+                enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'C'.code.toByte()))
+                for (chat in chats.values) {
+                    chat.msgs.takeLast(4).forEach { enqueue(listMessage(chat, it.first, it.second)) }
+                }
+            }
+        }
+    }
+
+    /** Takes the notification in as a chat (on the main thread); null if it is not an answerable chat message. */
+    private fun loadOne(c: Context, sbn: StatusBarNotification): Chat? {
+        val kind = appOf(sbn.packageName)
+        if (kind == 0 || RepliesIgnoreConfig.isIgnored(c, sbn.packageName)) return null // WATCHMENU_REPLIES_FILTER_V1
+        val n = sbn.notification ?: return null
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return null
+        val action = n.actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() && it.actionIntent != null } ?: return null
+        val ex = n.extras ?: return null
+        var title = (ex.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE) ?: ex.getCharSequence(Notification.EXTRA_TITLE))?.toString().orEmpty()
+        var body = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+        val msgs = ex.getParcelableArray(Notification.EXTRA_MESSAGES)
+        val all = ArrayList<Pair<String, Long>>()
+        val isGroup = ex.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false) || ex.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE) != null
+        msgs?.forEach { p ->
+            val m = p as? Bundle ?: return@forEach
+            val t = m.getCharSequence("text")?.toString()?.takeIf { it.isNotBlank() } ?: return@forEach
+            val who = senderName(m)
+            val line = if (isGroup && who.isNotBlank() && who != title) "$who: $t" else t
+            all.add(fitUtf8(line, TEXT_MAX) to m.getLong("time", sbn.postTime))
+        }
+        (msgs?.lastOrNull() as? Bundle)?.let { m ->
+            m.getCharSequence("text")?.toString()?.takeIf { it.isNotBlank() }?.let { body = it }
+            if (title.isBlank()) title = senderName(m)
+        }
+        if (title.isBlank() && body.isBlank()) return null
+        val name = fitUtf8(title, NAME_MAX)
+        val text = fitUtf8(body, TEXT_MAX)
+        val inputs = action.remoteInputs ?: return null
+        return run {
+            app = c.applicationContext
+            val identity = conversationKey(sbn, n)
+            val old = chats.remove(identity)
+            val id = old?.id ?: freeId()
+            val now = if (all.isEmpty()) listOf(text to sbn.postTime) else all.takeLast(6)
+            // only what the watch has not been given yet: drop the part of the new list it already knows
+            val known = old?.msgs.orEmpty().map { it.first }
+            var k = minOf(known.size, now.size)
+            while (k > 0 && known.takeLast(k) != now.take(k).map { it.first }) k--
+            val fresh = if (old == null) now else now.drop(k).ifEmpty { if (known.lastOrNull() == now.last().first) emptyList() else listOf(now.last()) }
+            val chat = Chat(id, identity, kind, sbn.packageName, name, text, sbn.postTime, action.actionIntent, inputs, now, fresh, old?.preserveUntil ?: 0L) // WATCHMENU_REPLIES_CHAT_PACKAGE_CALL_V1
+            chats[identity] = chat
+            while (chats.size > MAX_CHATS) {
+                val oldest = chats.values.first()
+                chats.remove(oldest.key)
+                if (open) enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'D'.code.toByte(), oldest.id.toByte()))
+            }
+            chat
+        }
+    }
+
+    private fun removeIfInactive(identity: String, packageName: String) {
+        val current = chats[identity] ?: return
+        val remaining = current.preserveUntil - System.currentTimeMillis()
+        if (remaining > 0L) {
+            handler.postDelayed({ removeIfInactive(identity, packageName) }, remaining + 100L)
+            return
+        }
+        val stillActive = try {
+            MediaListenerService.instance?.activeNotifications?.any { active ->
+                val activeNotification = active.notification
+                active.packageName == packageName && activeNotification != null &&
+                    conversationKey(active, activeNotification) == identity
+            } == true
+        } catch (_: Exception) { false }
+        if (stillActive) return
+        val gone = chats.remove(identity) ?: return
+        if (open) enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'D'.code.toByte(), gone.id.toByte()))
+    }
+
+    fun onRemoved(sbn: StatusBarNotification) {
+        if (appOf(sbn.packageName) == 0) return
+        val notification = sbn.notification ?: return
+        val identity = conversationKey(sbn, notification)
+        // Updates and replies can dismiss/repost the notification without ending the conversation.
+        handler.postDelayed({ removeIfInactive(identity, sbn.packageName) }, 1500L)
+    }
+
+    private fun freeId(): Int {
+        val used = chats.values.map { it.id }.toSet()
+        return (1..255).first { it !in used }
+    }
+
+    private fun senderPerson(message: Bundle): android.app.Person? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        return message.getParcelable<android.app.Person>("sender_person")
+            ?: message.getParcelable<android.app.Person>("person")
+    }
+
+    private fun senderName(message: Bundle): String {
+        val legacy = message.getCharSequence("sender")?.toString()?.takeIf { it.isNotBlank() }
+        if (legacy != null) return legacy
+        return senderPerson(message)?.name?.toString().orEmpty()
+    }
+
+    private fun senderIdentity(message: Bundle): String {
+        val person = senderPerson(message)
+        return person?.uri?.toString()?.takeIf { it.isNotBlank() }
+            ?: person?.key?.takeIf { it.isNotBlank() }
+            ?: person?.name?.toString()?.takeIf { it.isNotBlank() }
+            ?: message.getCharSequence("sender")?.toString().orEmpty()
+    }
+
+    /** Truncates UTF-8 text to [max] bytes without splitting a Unicode character. */
+    internal fun fitUtf8(s: String, max: Int): String {
+        if (max <= 0) return ""
+        val bytes = s.toByteArray(Charsets.UTF_8)
+        if (bytes.size <= max) return s
+        var end = max.coerceAtMost(bytes.size)
+        while (end > 0 && (bytes[end].toInt() and 0xC0) == 0x80) end--
+        return String(bytes, 0, end, Charsets.UTF_8).trimEnd()
+    }
+
+    // ---- frames from WatchApp ----
+
+    /** A ping said which app slot runs. True if it is the Replies app (Watch Music then ignores it). */
+    fun onPing(p: ByteArray): Boolean {
+        if (p.size < 3) return false
+        val s = p[1].toInt() and 0xFF
+        if (s != slot) {
+            // another app runs now: the Replies app is closed, and its acks are no longer ours
+            if (open && s != 0xFF && (p[2].toInt() and 1) != 0) { open = false; clearQueue() }
+            return false
+        }
+        if ((p[2].toInt() and 1) == 0) { open = false; clearQueue() }
+        return true
+    }
+
+    /** Watch Music said hello from [s]: that slot is not the Replies app (an app can be moved). */
+    fun musicHello(s: Int) {
+        slot = if (s == slot) -1 else slot
+        if (open) AppLogger.log("Replies", "Watch Music said hello: Replies closed")
+        open = false
+        clearQueue()
+    }
+
+    fun onEvent(s: Int, d: ByteArray) {
+        AppLogger.log("Replies", "from watch: ${d.size} bytes, kind ${d[2].toInt().toChar()}")
+        when (d[2].toInt().toChar()) {
+            'h' -> handler.post { hello(s) }
+            'x' -> if (d.size >= 5) { val copy = d.copyOf(); handler.post { reply(copy) } }
+            'm' -> {
+                val language = if (d.size >= 4 && d[3].toInt().toChar() == 'a') "ar-EG" else "en-US"
+                if (app != null || MediaListenerService.instance != null) PhoneDictationService.toggle(language) else voiceStatus(2)
+            }
+        }
+    }
+
+    /** State: 0 ready, 1 listening, 2 error. */
+    fun voiceStatus(state: Int) {
+        handler.post {
+            if (open) enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'S'.code.toByte(), state.coerceIn(0, 2).toByte()))
+        }
+    }
+
+    /** Sends a UTF-8-safe transcript in at most two 100-byte pieces for the watch's editable draft. */
+    fun voiceText(text: String) {
+        val bytes = fitUtf8(text.trim(), 200).toByteArray(Charsets.UTF_8)
+        if (bytes.isEmpty()) { voiceStatus(2); return }
+        handler.post {
+            if (!open) return@post
+            var offset = 0
+            var index = 0
+            while (offset < bytes.size && index < 2) {
+                var end = if (index == 1) bytes.size else minOf(offset + 100, bytes.size)
+                while (end < bytes.size && end > offset && (bytes[end].toInt() and 0xC0) == 0x80) end--
+                if (end == offset) end = minOf(offset + 100, bytes.size)
+                val last = end == bytes.size
+                val flags = (index and 15) or (if (last) 0x80 else 0)
+                enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'T'.code.toByte(), flags.toByte()) + bytes.copyOfRange(offset, end))
+                offset = end
+                index++
+            }
+        }
+    }
+
+    // ---- sending: one message at a time, each acknowledged ----
+
+    private val queue = ArrayDeque<ByteArray>()
+    private var inFlight: ByteArray? = null
+    private var tries = 0
+    private val timeout = Runnable { onTimeout() }
+
+    private fun enqueue(m: ByteArray) {
+        queue.addLast(m)
+        pump()
+    }
+
+    private fun pump() {
+        if (inFlight != null || !open) return
+        val m = queue.removeFirstOrNull() ?: return
+        inFlight = m
+        tries = 0
+        transmit()
+    }
+
+    private fun transmit() {
+        val m = inFlight ?: return
+        AppLogger.log("Replies", "to watch: kind ${m[2].toInt().toChar()}, ${m.size} bytes, try $tries")
+        WatchLink.appFrame(MSG, byteArrayOf(0xFF.toByte()) + m)
+        handler.removeCallbacks(timeout)
+        handler.postDelayed(timeout, 1500)
+    }
+
+    private fun onTimeout() {
+        if (inFlight == null) return
+        if (++tries > 3) clearQueue() else transmit()
+    }
+
+    private fun clearQueue() {
+        handler.removeCallbacks(timeout)
+        queue.clear()
+        inFlight = null
+    }
+
+    /** An ack arrived; true if the Replies app is the one running (Watch Music then ignores it). */
+    fun onAck(p: ByteArray): Boolean {
+        if (!open || inFlight == null) return false // not ours: Watch Music's acks must pass
+        handler.post {
+            when (if (p.isNotEmpty()) p[0].toInt() and 0xFF else 0) {
+                0 -> { handler.removeCallbacks(timeout); inFlight = null; pump() }
+                8, 9 -> { handler.removeCallbacks(timeout); handler.postDelayed({ transmit() }, 80) } // inbox full / popup
+                else -> clearQueue()
+            }
+        }
+        return true
+    }
+
+    // ---- the watch app ----
+
+    private fun hello(s: Int) {
+        slot = s
+        open = true
+        AppLogger.log("Replies", "hello from the Replies app (slot $s), ${chats.size} chats")
+        clearQueue()
+        // chats whose notifications came before this process listened are still on the phone: take them in
+        try { MediaListenerService.instance?.let { l -> l.activeNotifications?.sortedBy { it.postTime }?.forEach { loadOne(l.applicationContext, it) } } } catch (e: Exception) { AppLogger.logError("Replies", "active", e) }
+        enqueue(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'C'.code.toByte()))
+        val bytes = ArrayList<Byte>()
+        bytes.addAll(listOf('r'.code.toByte(), '1'.code.toByte(), 'Q'.code.toByte(), QUICK.size.toByte()))
+        val mine = app?.let { c -> NotificationForwarder.quickReplies(c).map { fitUtf8(it, 24) }.filter { it.isNotBlank() }.take(3) }.orEmpty().ifEmpty { QUICK }
+        bytes[3] = mine.size.toByte()
+        for (t in mine) { val b = t.toByteArray(); bytes.add(b.size.toByte()); bytes.addAll(b.toList()) }
+        enqueue(bytes.toByteArray())
+        for (c in chats.values) c.msgs.takeLast(4).forEach { enqueue(listMessage(c, it.first, it.second)) }
+    }
+
+    private fun listMessage(c: Chat, msg: String = c.text, at: Long = c.at): ByteArray {
+        val cal = Calendar.getInstance().apply { timeInMillis = at }
+        val name = c.name.toByteArray(Charsets.UTF_8)
+        val text = msg.toByteArray(Charsets.UTF_8)
+        return byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'L'.code.toByte(), c.id.toByte(), c.app.toByte(),
+            cal.get(Calendar.HOUR_OF_DAY).toByte(), cal.get(Calendar.MINUTE).toByte(), name.size.toByte()) + name + text
+    }
+
+    private val pieces = HashMap<Int, ByteArray>() // chat id -> text so far
+    private var nextPiece = HashMap<Int, Int>()
+
+    /** d = "r1x" id flags text...: a reply from the watch, in pieces. */
+    private fun reply(d: ByteArray) {
+        val id = d[3].toInt() and 0xFF
+        val flags = d[4].toInt() and 0xFF
+        val n = flags and 15
+        val last = flags and 0x80 != 0
+        val part = d.copyOfRange(5, d.size)
+        if (n == 0) { pieces[id] = part; nextPiece[id] = 1 }
+        else if (nextPiece[id] == n) { pieces[id] = (pieces[id] ?: ByteArray(0)) + part; nextPiece[id] = n + 1 }
+        else { pieces.remove(id); nextPiece.remove(id); result(id, false); return } // a piece went missing
+        if (!last) return
+        val text = String(pieces.remove(id) ?: return, Charsets.UTF_8).trim()
+        nextPiece.remove(id)
+        result(id, text.isNotEmpty() && fire(id, text))
+    }
+
+    private fun result(id: Int, ok: Boolean) {
+        AppLogger.log("Replies", "reply to chat $id: ${if (ok) "sent" else "failed"}")
+        queue.addFirst(byteArrayOf('r'.code.toByte(), '1'.code.toByte(), 'R'.code.toByte(), id.toByte(), if (ok) 0 else 1))
+        pump()
+    }
+
+    private fun fire(id: Int, text: String): Boolean {
+        val c = chats.values.firstOrNull { it.id == id } ?: return false
+        val ctx = app ?: return false
+        return try {
+            val intent = Intent()
+            val results = Bundle()
+            c.inputs.forEach { results.putCharSequence(it.resultKey, text) }
+            RemoteInput.addResultsToIntent(c.inputs, intent, results)
+            // Keep the thread record while the messaging app removes/reposts its notification.
+            c.preserveUntil = System.currentTimeMillis() + 30_000L
+            c.intent.send(ctx, 0, intent)
+            AppLogger.log("Replies", "Replied to ${c.name} (${c.key})")
+            true
+        } catch (e: Exception) {
+            AppLogger.logError("Replies", "reply", e)
+            false
+        }
+    }
+}

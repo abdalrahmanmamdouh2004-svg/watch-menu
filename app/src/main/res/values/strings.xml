@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Watch Menu 2</string>
+    <string name="accessibility_service_label">Watch Menu</string>
+    <string name="accessibility_service_desc">Lets Watch Menu lock the screen and take a screenshot when you pick those items in the watch menu. It does not read your screen or anything you type.</string>
+    <string name="media_listener_service_label">Watch Menu</string>
+</resources>

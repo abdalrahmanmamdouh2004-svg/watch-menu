@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Only Android 11 and older need location to scan for Bluetooth devices; Android 12+ never asks for it. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- "Display over other apps": Android only lets this app open another app's screen (a podcast episode, a link,
+         an app) while it is in the background, which is where it is when the watch asks, if this is granted. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <queries>
+        <package android:name="com.google.android.apps.youtube.music" />
+        <package android:name="app.revanced.android.apps.youtube.music" />
+        <package android:name="com.samsung.android.fmm" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.media.browse.MediaBrowserService" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.MyApplication">
+
+        <!-- The real app -->
+        <activity
+            android:name=".HomeActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:label="@string/app_name"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Share a song from a music app into the menu -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:label="Watch Menu 2"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+
+        <!-- Media Listener Service to enable MediaSessionManager.getActiveSessions -->
+        <service
+            android:name=".MediaListenerService"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:label="@string/media_listener_service_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Media session that takes over the watch's music screen -->
+        <service
+            android:name=".MediaMenuService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Kept alive while the companion is active; records only after the watch mic is tapped. -->
+        <service
+            android:name=".PhoneDictationService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- BroadcastReceiver for Watch / Notification Quick Reply -->
+        <receiver
+            android:name=".ReplyReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.ACTION_NOTIFICATION_REPLY" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Podcast episode decision and automatic 60-second advance. -->
+        <receiver
+            android:name=".PodcastDecisionReceiver"
+            android:exported="false" />
+
+    </application>
+
+</manifest>
